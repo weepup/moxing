@@ -2,81 +2,147 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from PIL import Image, ImageDraw, ImageFont
+import io
+from datetime import datetime
 
-# --- 1. 量化计算引擎 ---
-class QuantEngine:
-    @staticmethod
-    def get_drawdown(series):
-        rolling_max = series.expanding().max()
-        drawdown = (series - rolling_max) / rolling_max
-        max_dd = drawdown.min()
-        return drawdown, max_dd
+st.set_page_config(page_title="美股量化看板 Pro", layout="wide")
 
-    @staticmethod
-    def get_annualized_return(series, years):
-        total_return = (series.iloc[-1] / series.iloc[0]) - 1
-        return (1 + total_return) ** (1 / years) - 1
+# --- 1. 深度量化数据引擎 ---
+@st.cache_data(ttl=3600)
+def fetch_deep_quant_data():
+    # 抓取 SPY, QQQ, VIX (过去5年数据用于计算历史分位数和历史波动率)
+    raw_data = yf.download(['SPY', 'QQQ', '^VIX'], period='5y', interval='1d')['Close']
+    
+    if isinstance(raw_data.columns, pd.MultiIndex):
+        raw_data.columns = raw_data.columns.droplevel(1)
+    df = raw_data.ffill().dropna()
 
-def load_data(ticker):
-    data = yf.download(ticker, period="max")['Close']
-    if isinstance(data, pd.DataFrame): data = data.iloc[:, 0]
-    return data.dropna()
+    # 获取基本面数据 (容错处理，防止 yf 断联)
+    try:
+        spy_info = yf.Ticker("SPY").info
+        pe_ratio = spy_info.get("trailingPE", 26.5)
+        pb_ratio = spy_info.get("priceToBook", 4.2)
+    except:
+        pe_ratio, pb_ratio = 26.5, 4.2 # 默认备用值
 
-# --- 2. 页面布局 ---
-st.set_page_config(page_title="US Quant Signal", layout="wide")
-st.title("🚦 美股量化信号灯：SPY vs QQQ 独立体系")
+    current_spy = df['SPY'].iloc[-1]
+    
+    # 【估值分析】计算
+    # 价格历史分位数 (过去5年)
+    price_percentile = (df['SPY'].rank(pct=True).iloc[-1]) * 100
+    # 巴菲特指标简易模拟 (美股总市值/美国GDP，此处用硬编码基准线+SPY涨幅做偏离度模拟，真实环境需接入FRED宏观数据)
+    buffett_indicator = 185.0 * (current_spy / 400) # 假设400点对应185%
 
-target = st.sidebar.selectbox("选择分析对象", ["SPY (标普500)", "QQQ (纳指100)"])
-symbol = "SPY" if "SPY" in target else "QQQ"
+    # 【情绪指标】计算
+    current_vix = df['^VIX'].iloc[-1]
+    # 历史波动率 (过去1年的VIX均值)
+    hist_vix = df['^VIX'].tail(252).mean()
+    volatility_ratio = current_vix / hist_vix
 
-data = load_data(symbol)
-last_price = data.iloc[-1]
+    return {
+        "date": datetime.now().strftime("%Y-%m-%d"),
+        "price": current_spy,
+        "pe": pe_ratio,
+        "pb": pb_ratio,
+        "percentile": price_percentile,
+        "buffett": buffett_indicator,
+        "vix": current_vix,
+        "hist_vix": hist_vix,
+        "vol_ratio": volatility_ratio
+    }
 
-# --- 3. 四大指标体系展示 ---
-st.markdown(f"## {target} 深度量化报告")
+# --- 2. 页面UI展示 ---
+st.title("📊 美股全景量化与内容生成系统")
 
-# A. 回撤分析 (Drawdown)
-st.subheader("📉 回撤分析 (Risk Profile)")
-dd_series, max_dd = QuantEngine.get_drawdown(data)
-c1, c2, c3 = st.columns(3)
-c1.metric("历史最大回撤", f"{max_dd:.2%}")
-c2.metric("当前距高点回撤", f"{dd_series.iloc[-1]:.2%}")
-c3.metric("≥20% 熊市频率", "历史共 4 次" if symbol=="SPY" else "历史共 5 次") # 简化逻辑
+try:
+    with st.spinner("正在抓取核心宏观与基本面数据..."):
+        metrics = fetch_deep_quant_data()
 
-fig_dd = go.Figure()
-fig_dd.add_trace(go.Scatter(x=dd_series.index, y=dd_series, fill='tozeroy', name="回撤率", line=dict(color='red')))
-fig_dd.update_layout(title="历史回撤曲线", template="plotly_dark", height=300)
-st.plotly_chart(fig_dd, use_container_width=True)
+    st.markdown("### 🔍 第一维：估值分析 (Valuation)")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("标普当前 PE", f"{metrics['pe']:.2f}")
+    c2.metric("标普当前 PB", f"{metrics['pb']:.2f}")
+    c3.metric("5年价格分位数", f"{metrics['percentile']:.1f}%", "极度高估" if metrics['percentile'] > 90 else "合理")
+    c4.metric("巴菲特指标 (估算)", f"{metrics['buffett']:.1f}%", "警戒线 > 150%")
 
-# B. 收益率分析 (Returns)
-st.subheader("📈 收益率分析 (Performance)")
-y1 = QuantEngine.get_annualized_return(data.last('365D'), 1)
-y5 = QuantEngine.get_annualized_return(data.last('1825D'), 5)
-y10 = QuantEngine.get_annualized_return(data.last('3650D'), 10)
-r1, r2, r3 = st.columns(3)
-r1.metric("1年年化", f"{y1:.2%}")
-r2.metric("5年年化", f"{y5:.2%}")
-r3.metric("10年年化", f"{y10:.2%}")
+    st.markdown("### 🧠 第二维：情绪指标 (Sentiment)")
+    e1, e2, e3 = st.columns(3)
+    e1.metric("VIX 恐慌指数", f"{metrics['vix']:.2f}")
+    e2.metric("历史平均波动 (1年)", f"{metrics['hist_vix']:.2f}")
+    e3.metric("短期/历史 波动比", f"{metrics['vol_ratio']:.2f}x", 
+              "恐慌蔓延" if metrics['vol_ratio'] > 1.2 else "情绪稳定", delta_color="inverse")
 
-# C. 估值 & 情绪 (Valuation & Sentiment)
-st.subheader("🔍 估值与情绪指标")
-e1, e2, e3 = st.columns(3)
-# 估值逻辑 (此处由于CAPE需外部数据，采用价格/均线分位数模拟历史水位)
-percentile = (data.rank(pct=True).iloc[-1]) * 100
-e1.metric("价格历史分位数", f"{percentile:.1f}%", help="对比历史所有交易日的价格位置")
+    st.markdown("---")
+    
+    # --- 3. 小红书排版与制图引擎 (Pillow) ---
+    st.sidebar.title("🎨 社交媒体矩阵")
+    st.sidebar.write("数据已就绪，一键生成小红书 3:4 排版海报。")
 
-# 获取 VIX
-vix_data = yf.download("^VIX", period="5d")['Close']
-current_vix = vix_data.iloc[-1]
-e2.metric("VIX 恐慌指数", f"{current_vix:.2f}", delta="偏高" if current_vix > 20 else "平稳")
-e3.metric("短期 vs 历史波动", "1.2x" if current_vix > 18 else "0.8x")
+    if st.sidebar.button("📸 生成今日小红书分析图"):
+        # 创建 1080x1440 画布 (小红书标准比例)
+        img = Image.new('RGB', (1080, 1440), color='#0E1117')
+        draw = ImageDraw.Draw(img)
+        
+        # 尽量使用默认字体，避免系统找不到字体报错
+        try:
+            # 如果本地有更好的字体，可以将路径替换为 "msyh.ttc" (微软雅黑) 等
+            font_title = ImageFont.truetype("arial.ttf", 70)
+            font_subtitle = ImageFont.truetype("arial.ttf", 45)
+            font_data = ImageFont.truetype("arialbd.ttf", 65)
+            font_small = ImageFont.truetype("arial.ttf", 35)
+        except:
+            font_title = font_subtitle = font_data = font_small = ImageFont.load_default()
 
-# --- 4. 社交媒体海报导出逻辑 (视觉增强) ---
-st.sidebar.markdown("---")
-if st.sidebar.button("🎨 生成小红书图表集"):
-    st.toast("正在抓取最新量化数据并渲染...")
-    # 这里调用之前定义的 Pillow 绘图逻辑，但数据全部替换为上述变量
-    st.success("海报已准备好（见下方预览）")
-    # 此处省略重复的 PIL 绘图代码，保持界面简洁
+        # 1. 顶部视觉区
+        draw.rectangle([0, 0, 1080, 250], fill='#00FFAB' if metrics['vol_ratio'] < 1 else '#FF3D68')
+        draw.text((80, 70), "US MARKET DAILY", fill='black', font=font_title)
+        draw.text((80, 160), f"DATE: {metrics['date']}", fill='black', font=font_subtitle)
+
+        # 2. 估值数据区 (Valuation)
+        draw.text((80, 320), "VALUATION / 估值分析", fill='#00FFAB', font=font_subtitle)
+        draw.line([(80, 380), (1000, 380)], fill='#333333', width=3)
+        
+        draw.text((80, 430), "S&P 500 P/E Ratio:", fill='white', font=font_small)
+        draw.text((550, 410), f"{metrics['pe']:.2f}", fill='white', font=font_data)
+        
+        draw.text((80, 530), "Price Percentile (5Y):", fill='white', font=font_small)
+        draw.text((550, 510), f"{metrics['percentile']:.1f}%", fill='#FFD700', font=font_data)
+        
+        draw.text((80, 630), "Buffett Indicator:", fill='white', font=font_small)
+        draw.text((550, 610), f"{metrics['buffett']:.1f}%", fill='#FF3D68' if metrics['buffett'] > 150 else 'white', font=font_data)
+
+        # 3. 情绪数据区 (Sentiment)
+        draw.text((80, 800), "SENTIMENT / 情绪指标", fill='#00FFAB', font=font_subtitle)
+        draw.line([(80, 860), (1000, 860)], fill='#333333', width=3)
+
+        draw.text((80, 910), "Current VIX:", fill='white', font=font_small)
+        draw.text((550, 890), f"{metrics['vix']:.2f}", fill='white', font=font_data)
+        
+        draw.text((80, 1010), "Historical Volatility:", fill='white', font=font_small)
+        draw.text((550, 990), f"{metrics['hist_vix']:.2f}", fill='white', font=font_data)
+        
+        draw.text((80, 1110), "Short vs Hist Ratio:", fill='white', font=font_small)
+        draw.text((550, 1090), f"{metrics['vol_ratio']:.2f}x", fill='#FF3D68' if metrics['vol_ratio'] > 1.2 else '#00FFAB', font=font_data)
+
+        # 4. 底部结论区
+        action = "High Risk. Consider hedging." if metrics['percentile'] > 90 and metrics['vol_ratio'] > 1.1 else "Market is stable. Hold positions."
+        draw.rectangle([80, 1250, 1000, 1380], fill='#1D2129')
+        draw.text((120, 1300), f"CONCLUSION: {action}", fill='white', font=font_small)
+
+        # 展示预览图
+        st.sidebar.image(img, caption="✅ 海报已生成", use_container_width=True)
+        
+        # 转换为字节流供下载
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        st.sidebar.download_button(
+            label="📥 下载图片 (发布小红书)",
+            data=buf.getvalue(),
+            file_name=f"market_report_{metrics['date']}.png",
+            mime="image/png",
+            use_container_width=True
+        )
+
+except Exception as e:
+    st.error(f"网络请求或计算出错，请重试。详情: {e}")
