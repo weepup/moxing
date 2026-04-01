@@ -33,44 +33,52 @@ def get_dimension_state(value, dim_type):
         elif value > 0: return "正收益", "🟡", "温和上涨"
         else: return "负收益", "🟢", "过去一年回调，估值修复空间大"
 
-# 计算买入信号得分（越高越适合抄底）
+# 计算买入信号得分
 def calculate_buy_score(states):
     score = 0
     for state in states:
-        if "极度乐观" in state or "乐观" in state or "浅回撤" in state or "高估值" in state or "强劲收益" in state:
+        if any(x in state for x in ["极度乐观", "乐观", "浅回撤", "高估值", "强劲收益"]):
             score += 0
-        elif "中性" in state or "中等" in state:
+        elif any(x in state for x in ["中性", "中等"]):
             score += 1
-        else:  # 悲观/深回撤/低估值/极度恐慌/负收益
+        else:
             score += 2
     return score
 
-# ====================== 数据获取 ======================
-@st.cache_data(ttl=3600)  # 每小时刷新一次
+# ====================== 数据获取（已修复限流问题） ======================
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_data(ticker):
-    stock = yf.Ticker(ticker)
-    hist = stock.history(period="5y")
-    current_price = hist['Close'].iloc[-1]
-    ath = hist['Close'].max()
-    drawdown = round((ath - current_price) / ath * 100, 2)
-    
-    info = stock.info
-    pe = info.get('forwardPE') or info.get('trailingPE') or 25.0
-    
-    vix_data = yf.Ticker("^VIX").history(period="5d")
-    vix = round(vix_data['Close'].iloc[-1], 2)
-    
-    hist1y = stock.history(period="1y")
-    ret1y = round((hist1y['Close'].iloc[-1] / hist1y['Close'].iloc[0] - 1) * 100, 2)
-    
-    return {
-        "price": round(current_price, 2),
-        "drawdown": drawdown,
-        "pe": round(pe, 2),
-        "vix": vix,
-        "ret1y": ret1y,
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M")
-    }
+    try:
+        # 使用 download 获取价格数据（最稳定，不易限流）
+        hist = yf.download(ticker, period="5y", progress=False, auto_adjust=True)
+        current_price = hist['Close'].iloc[-1]
+        ath = hist['Close'].max()
+        drawdown = round((ath - current_price) / ath * 100, 2)
+        
+        hist1y = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
+        ret1y = round((hist1y['Close'].iloc[-1] / hist1y['Close'].iloc[0] - 1) * 100, 2)
+        
+        # VIX
+        vix_hist = yf.download("^VIX", period="5d", progress=False, auto_adjust=True)
+        vix = round(vix_hist['Close'].iloc[-1], 2)
+        
+        # 估值PE → 使用 fast_info 绕过限流（关键修复）
+        stock = yf.Ticker(ticker)
+        fast_info = stock.fast_info
+        pe = fast_info.get('forwardPE') or fast_info.get('trailingPE') or 25.0
+        pe = round(pe, 2)
+        
+        return {
+            "price": round(current_price, 2),
+            "drawdown": drawdown,
+            "pe": pe,
+            "vix": vix,
+            "ret1y": ret1y,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M")
+        }
+    except Exception as e:
+        st.error(f"数据获取异常（{ticker}）：{str(e)}，请稍后刷新")
+        return None
 
 # ====================== 主界面 ======================
 col1, col2 = st.columns(2)
@@ -78,69 +86,83 @@ col1, col2 = st.columns(2)
 with col1:
     st.subheader("🟦 SPY 信号灯")
     spy_data = fetch_data("SPY")
-    spy_panic_state, spy_panic_light, spy_panic_desc = get_dimension_state(spy_data["vix"], "panic")
-    spy_dd_state, spy_dd_light, spy_dd_desc = get_dimension_state(spy_data["drawdown"], "drawdown")
-    spy_val_state, spy_val_light, spy_val_desc = get_dimension_state(spy_data["pe"], "valuation")
-    spy_ret_state, spy_ret_light, spy_ret_desc = get_dimension_state(spy_data["ret1y"], "return")
-    
-    states = [spy_panic_state, spy_dd_state, spy_val_state, spy_ret_state]
-    total_score = calculate_buy_score(states)
-    if total_score >= 6: total_signal = "🟢 强力抄底信号（极度悲观）"
-    elif total_score >= 4: total_signal = "🟡 观察信号（中性）"
-    else: total_signal = "🔴 回避信号（极度乐观）"
-    
-    st.metric("当前价格", f"${spy_data['price']}", f"回撤 {spy_data['drawdown']}%")
-    st.write(f"**总信号**：{total_signal}")
-    
-    for name, state, light, desc in [
-        ("恐慌程度 (VIX)", spy_panic_state, spy_panic_light, spy_panic_desc),
-        ("回撤深度", spy_dd_state, spy_dd_light, spy_dd_desc),
-        ("估值水平", spy_val_state, spy_val_light, spy_val_desc),
-        ("历史收益 (1年)", spy_ret_state, spy_ret_light, spy_ret_desc)
-    ]:
-        st.write(f"{light} **{name}**：{state} —— {desc}")
+    if spy_data:
+        spy_panic_state, spy_panic_light, spy_panic_desc = get_dimension_state(spy_data["vix"], "panic")
+        spy_dd_state, spy_dd_light, spy_dd_desc = get_dimension_state(spy_data["drawdown"], "drawdown")
+        spy_val_state, spy_val_light, spy_val_desc = get_dimension_state(spy_data["pe"], "valuation")
+        spy_ret_state, spy_ret_light, spy_ret_desc = get_dimension_state(spy_data["ret1y"], "return")
+        
+        states = [spy_panic_state, spy_dd_state, spy_val_state, spy_ret_state]
+        total_score = calculate_buy_score(states)
+        if total_score >= 6: 
+            spy_total_signal = "🟢 强力抄底信号（极度悲观）"
+        elif total_score >= 4: 
+            spy_total_signal = "🟡 观察信号（中性）"
+        else: 
+            spy_total_signal = "🔴 回避信号（极度乐观）"
+        
+        st.metric("当前价格", f"${spy_data['price']}", f"回撤 {spy_data['drawdown']}%")
+        st.write(f"**总信号**：{spy_total_signal}")
+        
+        for name, state, light, desc in [
+            ("恐慌程度 (VIX)", spy_panic_state, spy_panic_light, spy_panic_desc),
+            ("回撤深度", spy_dd_state, spy_dd_light, spy_dd_desc),
+            ("估值水平", spy_val_state, spy_val_light, spy_val_desc),
+            ("历史收益 (1年)", spy_ret_state, spy_ret_light, spy_ret_desc)
+        ]:
+            st.write(f"{light} **{name}**：{state} —— {desc}")
 
 with col2:
     st.subheader("🟨 QQQ 信号灯")
     qqq_data = fetch_data("QQQ")
-    qqq_panic_state, qqq_panic_light, qqq_panic_desc = get_dimension_state(qqq_data["vix"], "panic")
-    qqq_dd_state, qqq_dd_light, qqq_dd_desc = get_dimension_state(qqq_data["drawdown"], "drawdown")
-    qqq_val_state, qqq_val_light, qqq_val_desc = get_dimension_state(qqq_data["pe"], "valuation")
-    qqq_ret_state, qqq_ret_light, qqq_ret_desc = get_dimension_state(qqq_data["ret1y"], "return")
-    
-    states = [qqq_panic_state, qqq_dd_state, qqq_val_state, qqq_ret_state]
-    total_score = calculate_buy_score(states)
-    if total_score >= 6: total_signal = "🟢 强力抄底信号（极度悲观）"
-    elif total_score >= 4: total_signal = "🟡 观察信号（中性）"
-    else: total_signal = "🔴 回避信号（极度乐观）"
-    
-    st.metric("当前价格", f"${qqq_data['price']}", f"回撤 {qqq_data['drawdown']}%")
-    st.write(f"**总信号**：{total_signal}")
-    
-    for name, state, light, desc in [
-        ("恐慌程度 (VIX)", qqq_panic_state, qqq_panic_light, qqq_panic_desc),
-        ("回撤深度", qqq_dd_state, qqq_dd_light, qqq_dd_desc),
-        ("估值水平", qqq_val_state, qqq_val_light, qqq_val_desc),
-        ("历史收益 (1年)", qqq_ret_state, qqq_ret_light, qqq_ret_desc)
-    ]:
-        st.write(f"{light} **{name}**：{state} —— {desc}")
+    if qqq_data:
+        qqq_panic_state, qqq_panic_light, qqq_panic_desc = get_dimension_state(qqq_data["vix"], "panic")
+        qqq_dd_state, qqq_dd_light, qqq_dd_desc = get_dimension_state(qqq_data["drawdown"], "drawdown")
+        qqq_val_state, qqq_val_light, qqq_val_desc = get_dimension_state(qqq_data["pe"], "valuation")
+        qqq_ret_state, qqq_ret_light, qqq_ret_desc = get_dimension_state(qqq_data["ret1y"], "return")
+        
+        states = [qqq_panic_state, qqq_dd_state, qqq_val_state, qqq_ret_state]
+        total_score = calculate_buy_score(states)
+        if total_score >= 6: 
+            qqq_total_signal = "🟢 强力抄底信号（极度悲观）"
+        elif total_score >= 4: 
+            qqq_total_signal = "🟡 观察信号（中性）"
+        else: 
+            qqq_total_signal = "🔴 回避信号（极度乐观）"
+        
+        st.metric("当前价格", f"${qqq_data['price']}", f"回撤 {qqq_data['drawdown']}%")
+        st.write(f"**总信号**：{qqq_total_signal}")
+        
+        for name, state, light, desc in [
+            ("恐慌程度 (VIX)", qqq_panic_state, qqq_panic_light, qqq_panic_desc),
+            ("回撤深度", qqq_dd_state, qqq_dd_light, qqq_dd_desc),
+            ("估值水平", qqq_val_state, qqq_val_light, qqq_val_desc),
+            ("历史收益 (1年)", qqq_ret_state, qqq_ret_light, qqq_ret_desc)
+        ]:
+            st.write(f"{light} **{name}**：{state} —— {desc}")
 
 st.divider()
-st.success(f"📅 数据更新时间：{spy_data['date']}（每日自动刷新）")
+st.success(f"📅 数据更新时间：{spy_data['date'] if spy_data else 'N/A'}（每小时自动刷新）")
 
 # ====================== 小红书图片生成 ======================
 def generate_xhs_image(ticker, data, states_list, total_signal, filename):
     os.makedirs("xhs_images", exist_ok=True)
-    img = Image.new("RGB", (1080, 1350), (15, 23, 42))  # 深蓝高端风
+    img = Image.new("RGB", (1080, 1350), (15, 23, 42))
     draw = ImageDraw.Draw(img)
+    
+    # 字体兼容 Streamlit Cloud（Linux）+ Mac
     try:
-        font_big = ImageFont.truetype("/System/Library/Fonts/PingFang.ttc", 80)
-        font_mid = ImageFont.truetype("/System/Library/Fonts/PingFang.ttc", 50)
-        font_small = ImageFont.truetype("/System/Library/Fonts/PingFang.ttc", 35)
+        if os.path.exists("/System/Library/Fonts/PingFang.ttc"):
+            font_big = ImageFont.truetype("/System/Library/Fonts/PingFang.ttc", 80)
+            font_mid = ImageFont.truetype("/System/Library/Fonts/PingFang.ttc", 50)
+            font_small = ImageFont.truetype("/System/Library/Fonts/PingFang.ttc", 35)
+        else:
+            # Cloud 环境 fallback
+            font_big = ImageFont.load_default()
+            font_mid = ImageFont.load_default()
+            font_small = ImageFont.load_default()
     except:
-        font_big = ImageFont.load_default()
-        font_mid = ImageFont.load_default()
-        font_small = ImageFont.load_default()
+        font_big = font_mid = font_small = ImageFont.load_default()
     
     # 标题
     draw.text((100, 80), f"{ticker} 信号灯", fill="#00FFAA", font=font_big)
@@ -156,7 +178,7 @@ def generate_xhs_image(ticker, data, states_list, total_signal, filename):
         draw.text((100, y), f"{light} {name}：{state}", fill="#FFFFFF", font=font_mid)
         y += 110
     
-    # 底部信息
+    # 底部
     draw.text((100, 1150), f"数据日期：{data['date']}\n回撤 {data['drawdown']}% | VIX {data['vix']}", fill="#AAAAAA", font=font_small)
     draw.text((100, 1250), "🚦 信号灯工具 | 仅供参考 · 非投资建议", fill="#666666", font=font_small)
     
@@ -164,25 +186,26 @@ def generate_xhs_image(ticker, data, states_list, total_signal, filename):
     return f"xhs_images/{filename}"
 
 if st.button("🎨 一键生成小红书图片（SPY + QQQ + 总览）", type="primary", use_container_width=True):
-    # SPY
-    spy_states = [
-        ("恐慌程度", spy_panic_state, spy_panic_light),
-        ("回撤深度", spy_dd_state, spy_dd_light),
-        ("估值水平", spy_val_state, spy_val_light),
-        ("历史收益", spy_ret_state, spy_ret_light)
-    ]
-    generate_xhs_image("SPY", spy_data, spy_states, total_signal, "SPY_信号灯.png")
-    
-    # QQQ
-    qqq_states = [
-        ("恐慌程度", qqq_panic_state, qqq_panic_light),
-        ("回撤深度", qqq_dd_state, qqq_dd_light),
-        ("估值水平", qqq_val_state, qqq_val_light),
-        ("历史收益", qqq_ret_state, qqq_ret_light)
-    ]
-    generate_xhs_image("QQQ", qqq_data, qqq_states, total_signal, "QQQ_信号灯.png")
-    
-    st.success("✅ 图片已生成！文件夹路径：`./xhs_images/`")
-    st.balloons()
+    if spy_data and qqq_data:
+        spy_states = [
+            ("恐慌程度", spy_panic_state, spy_panic_light),
+            ("回撤深度", spy_dd_state, spy_dd_light),
+            ("估值水平", spy_val_state, spy_val_light),
+            ("历史收益", spy_ret_state, spy_ret_light)
+        ]
+        generate_xhs_image("SPY", spy_data, spy_states, spy_total_signal, "SPY_信号灯.png")
+        
+        qqq_states = [
+            ("恐慌程度", qqq_panic_state, qqq_panic_light),
+            ("回撤深度", qqq_dd_state, qqq_dd_light),
+            ("估值水平", qqq_val_state, qqq_val_light),
+            ("历史收益", qqq_ret_state, qqq_ret_light)
+        ]
+        generate_xhs_image("QQQ", qqq_data, qqq_states, qqq_total_signal, "QQQ_信号灯.png")
+        
+        st.success("✅ 图片已生成！路径：`./xhs_images/`（可直接发小红书）")
+        st.balloons()
+    else:
+        st.error("数据尚未加载完成，请刷新页面后重试")
 
-st.info("📌 阈值已严格对齐原文示例（VIX=11=极度乐观），您可在代码中自行微调 get_dimension_state 函数以 100% 匹配原文表格。")
+st.info("📌 若 Cloud 上图片中文显示方块，建议本地运行（Mac/Windows）生成图片，或用 Canva 简单美化后发布。")
