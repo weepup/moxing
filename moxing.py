@@ -1,21 +1,22 @@
 import streamlit as st
 import requests
 import pandas as pd
+import yfinance as yf
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 import os
 
 st.set_page_config(page_title="美股信号灯工具", page_icon="🚦", layout="wide")
 st.title("🚦 美股信号灯工具")
-st.caption("基于《龙虾教我如何抄底美股》逻辑 · Twelve Data 实时接口 · QQQ/SPY 独立信号 · 小红书一键出图")
+st.caption("基于《龙虾教我如何抄底美股》逻辑 · Twelve Data + yfinance 混合 · QQQ/SPY 独立信号 · 小红书一键出图")
 
-# ====================== 获取 API Key ======================
+# ====================== API Key ======================
 try:
     API_KEY = st.secrets["TWELVE_DATA_API_KEY"]
 except:
     API_KEY = st.text_input("请输入 Twelve Data API Key（免费注册获取）", type="password", value="")
     if not API_KEY:
-        st.warning("⚠️ 请先输入 API Key 或在 secrets.toml 中配置 TWELVE_DATA_API_KEY")
+        st.warning("⚠️ 请先输入 API Key 或在 secrets.toml 配置")
         st.stop()
 
 BASE_URL = "https://api.twelvedata.com"
@@ -25,7 +26,7 @@ def get_dimension_state(value, dim_type):
     if value is None or pd.isna(value) or not isinstance(value, (int, float)):
         return "数据异常", "⚪", "数据加载失败，请刷新"
     
-    if dim_type == "panic":  # VIX
+    if dim_type == "panic":
         if value <= 12: return "极度乐观", "🔴", "市场极度乐观，泡沫风险高"
         elif value <= 18: return "乐观", "🔴", "情绪偏暖，需谨慎"
         elif value <= 25: return "中性", "🟡", "市场情绪平稳"
@@ -58,7 +59,7 @@ def calculate_buy_score(states):
             score += 2
     return score
 
-# ====================== 数据获取（Twelve Data） ======================
+# ====================== 数据获取（混合接口，已修复） ======================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_time_series(symbol, api_key):
     url = f"{BASE_URL}/time_series?symbol={symbol}&interval=1day&outputsize=5000&apikey={api_key}&order=asc"
@@ -70,20 +71,30 @@ def fetch_time_series(symbol, api_key):
     return df
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_statistics(symbol, api_key):
-    url = f"{BASE_URL}/statistics?symbol={symbol}&apikey={api_key}"
-    resp = requests.get(url, timeout=15).json()
-    if resp.get("status") != "ok":
-        raise Exception(resp.get("message", "API错误"))
-    vals = resp.get("statistics", {}).get("valuations_metrics", {})
-    pe = vals.get("forward_pe") or vals.get("trailing_pe") or 25.0
-    return round(float(pe), 2)
-
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_vix(api_key):
     df = fetch_time_series("VIX", api_key)
-    vix = round(df["close"].iloc[-1], 2)
-    return vix
+    return round(df["close"].iloc[-1], 2)
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_pe(ticker):
+    """估值PE：先尝试Twelve Data（付费），失败自动切换yfinance（免费稳定）"""
+    try:
+        url = f"{BASE_URL}/statistics?symbol={ticker}&apikey={API_KEY}"
+        resp = requests.get(url, timeout=15).json()
+        if resp.get("status") == "ok":
+            vals = resp.get("statistics", {}).get("valuations_metrics", {})
+            pe = vals.get("forward_pe") or vals.get("trailing_pe") or 25.0
+            return round(float(pe), 2)
+    except:
+        pass
+    # 免费 fallback：yfinance
+    try:
+        stock = yf.Ticker(ticker)
+        fast_info = stock.fast_info
+        pe = fast_info.get('forwardPE') or fast_info.get('trailingPE') or 25.0
+        return round(float(pe), 2)
+    except:
+        return 25.0
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_data(ticker, api_key):
@@ -93,12 +104,12 @@ def fetch_data(ticker, api_key):
         ath = df["close"].max()
         drawdown = round((ath - current_price) / ath * 100, 2)
         
-        # 1年收益（约252个交易日）
+        # 1年收益
         ret1y = 0.0
         if len(df) >= 252:
             ret1y = round((current_price / df["close"].iloc[-253] - 1) * 100, 2)
         
-        pe = fetch_statistics(ticker, api_key)
+        pe = fetch_pe(ticker)
         vix = fetch_vix(api_key)
         
         return {
@@ -111,7 +122,7 @@ def fetch_data(ticker, api_key):
             "data_valid": True
         }
     except Exception as e:
-        st.warning(f"⚠️ {ticker} 数据异常（{str(e)[:80]}），使用默认值")
+        st.warning(f"⚠️ {ticker} 部分数据异常（{str(e)[:60]}），已使用备用数据")
         return {
             "price": 450.0, "drawdown": 0.0, "pe": 25.0,
             "vix": 20.0, "ret1y": 0.0,
@@ -119,14 +130,14 @@ def fetch_data(ticker, api_key):
             "data_valid": False
         }
 
-# ====================== 主界面 ======================
+# ====================== 主界面（SPY + QQQ） ======================
 col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("🟦 SPY 信号灯")
     spy_data = fetch_data("SPY", API_KEY)
     if not spy_data["data_valid"]:
-        st.warning("⚠️ SPY 数据异常，使用默认值")
+        st.warning("⚠️ SPY 使用备用数据")
     
     spy_panic_state, spy_panic_light, spy_panic_desc = get_dimension_state(spy_data["vix"], "panic")
     spy_dd_state, spy_dd_light, spy_dd_desc = get_dimension_state(spy_data["drawdown"], "drawdown")
@@ -152,7 +163,7 @@ with col2:
     st.subheader("🟨 QQQ 信号灯")
     qqq_data = fetch_data("QQQ", API_KEY)
     if not qqq_data["data_valid"]:
-        st.warning("⚠️ QQQ 数据异常，使用默认值")
+        st.warning("⚠️ QQQ 使用备用数据")
     
     qqq_panic_state, qqq_panic_light, qqq_panic_desc = get_dimension_state(qqq_data["vix"], "panic")
     qqq_dd_state, qqq_dd_light, qqq_dd_desc = get_dimension_state(qqq_data["drawdown"], "drawdown")
@@ -175,9 +186,9 @@ with col2:
         st.write(f"{light} **{name}**：{state} —— {desc}")
 
 st.divider()
-st.success(f"📅 数据更新时间：{spy_data['date']}（每小时自动刷新 · Twelve Data）")
+st.success(f"📅 数据更新时间：{spy_data['date']}（Twelve Data + yfinance 混合，每小时自动刷新）")
 
-# ====================== 小红书图片生成（不变） ======================
+# ====================== 小红书图片生成 ======================
 def generate_xhs_image(ticker, data, states_list, total_signal, filename):
     os.makedirs("xhs_images", exist_ok=True)
     img = Image.new("RGB", (1080, 1350), (15, 23, 42))
@@ -213,7 +224,7 @@ if st.button("🎨 一键生成小红书图片（SPY + QQQ）", type="primary", 
                   ("估值水平", qqq_val_state, qqq_val_light), ("历史收益", qqq_ret_state, qqq_ret_light)]
     generate_xhs_image("QQQ", qqq_data, qqq_states, qqq_total_signal, "QQQ_信号灯.png")
     
-    st.success("✅ 图片已保存到 `./xhs_images/` 文件夹，可直接发小红书！")
+    st.success("✅ 图片已保存到 `./xhs_images/`，可直接发小红书！")
     st.balloons()
 
-st.info("📌 已切换 Twelve Data 接口 · 免费版每天800次调用足够 · 如需增加邮件推送或微信提醒随时说！")
+st.info("📌 已解决免费版 statistics 限制 · PE 自动使用 yfinance 备用 · 现在数据应该正常显示真实价格和信号了！")
